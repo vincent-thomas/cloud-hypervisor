@@ -3090,6 +3090,13 @@ impl Vm {
         self.memory_manager.lock().unwrap().restoring()
     }
 
+    pub fn restore_memory_owned_by_peer(&self) -> bool {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .restore_memory_owned_by_peer()
+    }
+
     pub fn device_tree(&self) -> Arc<Mutex<DeviceTree>> {
         self.device_manager.lock().unwrap().device_tree()
     }

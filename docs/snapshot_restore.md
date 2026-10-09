@@ -342,6 +342,38 @@ prefault on the receiving side:
     receive-migration receiver_url=unix:/tmp/restore.sock,postcopy_prefault=off &
 ```
 
+### Snapshotting during an on demand restore
+
+While pages are still unpopulated, `vm.snapshot` and precopy or postcopy
+migrations are refused: Cloud Hypervisor cannot tell an unpopulated page from
+a zero page.
+
+A `send-migration` with `memory_mode=memfds` is accepted when all guest RAM is
+backed by the memfds of the daemon serving page faults. Cloud Hypervisor hands
+those memfds back and does not read them through the file. Any guest RAM it
+touches while pausing and saving device state faults and is served by the
+daemon, which knows which pages are still unpopulated.
+
+```bash
+./ch-remote --api-socket /tmp/cloud-hypervisor.sock pause
+./ch-remote --api-socket /tmp/cloud-hypervisor.sock \
+    send-migration destination_url=unix:/tmp/snapshot.sock,memory_mode=memfds,preserve_source=on
+./ch-remote --api-socket /tmp/cloud-hypervisor.sock resume
+```
+
+The receiver of such a snapshot must:
+
+- be the daemon serving the page faults, or resolve unpopulated pages through
+  it. A receiver that reads unpopulated pages as zeros, like the snapshot mode
+  of the reference daemon, records an incomplete snapshot;
+- keep serving page faults while it receives the snapshot, since saving device
+  state may touch unpopulated pages;
+- persist the populated pages before acknowledging `CompletePaused`.
+
+The exception does not apply once guest RAM that the daemon did not provide
+exists, such as memory hotplugged after the restore or virtio-mem regions.
+Such a VM is only snapshotted once every page is populated.
+
 ### The daemon protocol
 
 The daemon implements the local live-migration wire protocol defined in

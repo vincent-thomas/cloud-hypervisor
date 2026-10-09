@@ -71,6 +71,9 @@ struct UffdHandler {
     handle: thread::JoinHandle<()>,
     fault_socket_fd: Option<OwnedFd>,
     prefault_complete: Arc<AtomicBool>,
+    /// Bytes of guest RAM backed by memfds from the peer serving faults and
+    /// registered with this handler. Zero unless the peer provided the RAM.
+    peer_owned_bytes: u64,
 }
 
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
@@ -1103,6 +1106,7 @@ impl MemoryManager {
         };
 
         info!("UFFD: postcopy background prefault {background_prefault}");
+        let registered_bytes = ranges.iter().map(|r| r.length).sum();
         self.spawn_uffd_handler(
             uffd_fd,
             Some(socket_fd),
@@ -1110,7 +1114,11 @@ impl MemoryManager {
             source,
             exit_evt,
             background_prefault,
-        )
+        )?;
+        if shared_backing && let Some(handler) = self.uffd_handler.as_mut() {
+            handler.peer_owned_bytes = registered_bytes;
+        }
+        Ok(())
     }
 
     /// Create a UFFD fd and register every range.
@@ -1275,6 +1283,7 @@ impl MemoryManager {
             handle,
             fault_socket_fd,
             prefault_complete,
+            peer_owned_bytes: 0,
         });
 
         Ok(())
@@ -1314,6 +1323,16 @@ impl MemoryManager {
                 _ => {}
             }
         }
+    }
+
+    /// True when all guest RAM is backed by memfds from the peer serving
+    /// faults, so that peer knows which pages are still unpopulated. RAM
+    /// added since the restore, or virtio-mem blocks, is not covered.
+    pub fn restore_memory_owned_by_peer(&self) -> bool {
+        let guest_ram_bytes: u64 = self.guest_ram_mappings.iter().map(|m| m.size).sum();
+        self.uffd_handler
+            .as_ref()
+            .is_some_and(|h| h.peer_owned_bytes != 0 && h.peer_owned_bytes == guest_ram_bytes)
     }
 
     /// True while an on-demand (UFFD) restore is still faulting in guest RAM.

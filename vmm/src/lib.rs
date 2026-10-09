@@ -3407,7 +3407,15 @@ impl RequestHandler for Vmm {
     ) -> result::Result<(), MigratableError> {
         match self.vm {
             VmOwnership::Owned(ref vm) => {
-                if vm.restoring() {
+                // A memfds send-migration may proceed mid-restore when the
+                // peer serving page faults provided all guest RAM. CH does not
+                // read the memfds through the file on that path, and any
+                // access it makes faults and is served by that peer, which
+                // knows which pages it has not populated yet.
+                let to_memory_owner = send_data_migration.effective_memory_mode()
+                    == MigrationMode::MemFDs
+                    && vm.restore_memory_owned_by_peer();
+                if vm.restoring() && !to_memory_owner {
                     return Err(MigratableError::Conflict(anyhow!(
                         "An on-demand memory restore is still in progress"
                     )));
