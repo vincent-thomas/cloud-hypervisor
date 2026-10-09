@@ -1071,7 +1071,7 @@ impl MemoryManager {
         else {
             return Ok(());
         };
-        self.spawn_uffd_handler(uffd_fd, None, ranges, source, exit_evt)?;
+        self.spawn_uffd_handler(uffd_fd, None, ranges, source, exit_evt, true)?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
     }
@@ -1082,6 +1082,7 @@ impl MemoryManager {
         &mut self,
         saved_regions: &MemoryRangeTable,
         shared_backing: bool,
+        background_prefault: bool,
         socket: SocketStream,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
@@ -1101,7 +1102,15 @@ impl MemoryManager {
             return Ok(());
         };
 
-        self.spawn_uffd_handler(uffd_fd, Some(socket_fd), ranges, source, exit_evt)
+        info!("UFFD: postcopy background prefault {background_prefault}");
+        self.spawn_uffd_handler(
+            uffd_fd,
+            Some(socket_fd),
+            ranges,
+            source,
+            exit_evt,
+            background_prefault,
+        )
     }
 
     /// Create a UFFD fd and register every range.
@@ -1200,6 +1209,7 @@ impl MemoryManager {
         handler_ranges: Vec<UffdRange>,
         source: Box<dyn UffdMemorySource>,
         exit_evt: &EventFd,
+        background_prefault: bool,
     ) -> Result<(), Error> {
         info!(
             "UFFD: spawning handler for {} region(s)",
@@ -1226,6 +1236,7 @@ impl MemoryManager {
                         &handler_ranges,
                         &ready_tx,
                         &thread_prefault_complete,
+                        background_prefault,
                     );
 
                     if result.is_err() && thread_stop_event.read().is_ok() {
@@ -1337,6 +1348,7 @@ impl MemoryManager {
     /// Serve UFFD faults via `source`, prefaulting one page per idle
     /// iteration. Once `source` fails, poison each faulted page instead.
     #[expect(clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments)]
     fn uffd_handler_loop(
         uffd_fd: OwnedFd,
         stop_event: &EventFd,
@@ -1345,6 +1357,7 @@ impl MemoryManager {
         ranges: &[UffdRange],
         ready_tx: &SyncSender<()>,
         prefault_complete: &AtomicBool,
+        background_prefault: bool,
     ) -> Result<(), io::Error> {
         let uffd_raw_fd = uffd_fd.as_raw_fd();
 
@@ -1367,7 +1380,7 @@ impl MemoryManager {
 
         let pages_loading: Mutex<HashSet<(usize, u64)>> = Mutex::new(HashSet::new());
 
-        let mut prefault_active = !ranges.is_empty();
+        let mut prefault_active = background_prefault && !ranges.is_empty();
         let mut source_failed = false;
         let mut range_idx = 0;
         let mut page_idx = 0;
