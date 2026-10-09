@@ -9353,6 +9353,12 @@ mod ivshmem {
     }
 
     #[test]
+    #[cfg(not(feature = "mshv"))]
+    fn test_snapshot_restore_offload_ondemand_snapshot() {
+        snapshot_restore_common::_test_snapshot_restore_offload_ondemand_snapshot();
+    }
+
+    #[test]
     fn test_virtio_pmem_persist_writes() {
         test_virtio_pmem(false, false);
     }
@@ -10438,6 +10444,215 @@ mod snapshot_restore_common {
         let _ = remove_dir_all(offload_dir.as_str());
         let _ = remove_dir_all(offload_dir2.as_str());
         handle_child_output(r, &output);
+    }
+
+    // Snapshot a VM restored on demand without background prefault while
+    // pages are still unpopulated, then restore from that snapshot.
+    pub(crate) fn _test_snapshot_restore_offload_ondemand_snapshot() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let tmp_path =
+            |name: &str| String::from(guest.tmp_dir.as_path().join(name).to_str().unwrap());
+        let offload_dir = tmp_path("offload-store");
+        let snapshots_dir = tmp_path("offload-ondemand-snapshots");
+        let file_snapshot_dir = tmp_path("file-snapshot");
+        fs::create_dir(&offload_dir).unwrap();
+        fs::create_dir(&file_snapshot_dir).unwrap();
+        let snapshot_socket = tmp_path("snapshot-offload.sock");
+        let restore_socket = tmp_path("restore-offload.sock");
+        let ondemand_snapshot_socket = tmp_path("ondemand-snapshot.sock");
+        let md5 = |path: &str| {
+            guest
+                .ssh_command(&format!("md5sum {path} | cut -d' ' -f1"))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        // Guest RAM content checked across every snapshot and restore.
+        let base_md5 = Mutex::new(String::new());
+        let new_md5 = Mutex::new(String::new());
+        let daemon: Mutex<Option<Child>> = Mutex::new(None);
+        let stop_daemon = || {
+            if let Some(mut child) = daemon.lock().unwrap().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        };
+
+        // Boot, write data into guest RAM and snapshot through the daemon.
+        let api_socket_source = format!("{}.1", temp_api_path(&guest.tmp_dir));
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_source])
+            .args(["--cpus", "boot=2"])
+            .args(["--memory", "size=512M,shared=on"])
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            guest
+                .ssh_command("dd if=/dev/urandom of=/dev/shm/base bs=1M count=64 2>/dev/null")
+                .unwrap();
+            *base_md5.lock().unwrap() = md5("/dev/shm/base");
+
+            *daemon.lock().unwrap() = Some(
+                Command::new(clh_command("offload_daemon"))
+                    .args([
+                        "snapshot",
+                        "--socket",
+                        &snapshot_socket,
+                        "--output-dir",
+                        &offload_dir,
+                    ])
+                    .spawn()
+                    .unwrap(),
+            );
+            assert!(wait_until(Duration::from_secs(5), || Path::new(
+                &snapshot_socket
+            )
+            .exists()));
+            assert!(remote_command(&api_socket_source, "pause", None));
+            assert!(remote_command(
+                &api_socket_source,
+                "send-migration",
+                Some(format!("destination_url=unix:{snapshot_socket},memory_mode=memfds").as_str()),
+            ));
+            let status = daemon.lock().unwrap().take().unwrap().wait().unwrap();
+            assert!(status.success(), "offload daemon (snapshot) failed");
+        });
+        stop_daemon();
+        if !wait_until(Duration::from_secs(30), || {
+            matches!(child.try_wait(), Ok(Some(_)))
+        }) {
+            kill_child(&mut child);
+        }
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        // Restore on demand from `input_dir` through a new VMM.
+        let restore =
+            |api_socket: &str, input_dir: &str, receive_options: &str, snapshots: bool| {
+                assert!(wait_until(Duration::from_secs(30), || remote_command(
+                    api_socket, "ping", None
+                )));
+                let _ = fs::remove_file(&restore_socket);
+                let receive_api_socket = api_socket.to_string();
+                let receive_arg = format!("receiver_url=unix:{restore_socket}{receive_options}");
+                let receive_thread = thread::spawn(move || {
+                    remote_command(&receive_api_socket, "receive-migration", Some(&receive_arg))
+                });
+                assert!(wait_until(Duration::from_secs(10), || Path::new(
+                    &restore_socket
+                )
+                .exists()));
+                let mut args = vec![
+                    "restore",
+                    "--socket",
+                    &restore_socket,
+                    "--input-dir",
+                    input_dir,
+                    "--resume",
+                    "--ondemand",
+                ];
+                if snapshots {
+                    args.extend([
+                        "--snapshot-socket",
+                        &ondemand_snapshot_socket,
+                        "--snapshot-dir",
+                        &snapshots_dir,
+                    ]);
+                }
+                *daemon.lock().unwrap() = Some(
+                    Command::new(clh_command("offload_daemon"))
+                        .args(&args)
+                        .spawn()
+                        .unwrap(),
+                );
+                assert!(
+                    receive_thread.join().unwrap(),
+                    "ch-remote receive-migration command failed"
+                );
+                guest.wait_for_ssh(Duration::from_secs(30)).unwrap();
+            };
+
+        // Restore without background prefault and snapshot while pages are
+        // still unpopulated.
+        let api_socket_restored = format!("{}.2", temp_api_path(&guest.tmp_dir));
+        let mut restored_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_restored])
+            .capture_output()
+            .spawn()
+            .unwrap();
+        let r = panic::catch_unwind(|| {
+            restore(
+                &api_socket_restored,
+                &offload_dir,
+                ",postcopy_prefault=off",
+                true,
+            );
+            assert_eq!(md5("/dev/shm/base"), *base_md5.lock().unwrap());
+            guest
+                .ssh_command("dd if=/dev/urandom of=/dev/shm/new bs=1M count=16 2>/dev/null")
+                .unwrap();
+            *new_md5.lock().unwrap() = md5("/dev/shm/new");
+
+            assert!(remote_command(&api_socket_restored, "pause", None));
+            // CH cannot write a complete snapshot of unpopulated memory itself.
+            assert!(!remote_command(
+                &api_socket_restored,
+                "snapshot",
+                Some(format!("file://{file_snapshot_dir}").as_str()),
+            ));
+            // The daemon serving the pages can.
+            assert!(remote_command(
+                &api_socket_restored,
+                "send-migration",
+                Some(
+                    format!(
+                        "destination_url=unix:{ondemand_snapshot_socket},memory_mode=memfds,preserve_source=on"
+                    )
+                    .as_str()
+                ),
+            ));
+            assert!(wait_until(Duration::from_secs(30), || {
+                Path::new(&snapshots_dir).join("1").join("base").exists()
+            }));
+            assert!(wait_until(Duration::from_secs(10), || remote_command(
+                &api_socket_restored,
+                "resume",
+                None
+            )));
+            assert_eq!(md5("/dev/shm/new"), *new_md5.lock().unwrap());
+        });
+        stop_daemon();
+        kill_child(&mut restored_child);
+        let output = restored_child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        // Restore the snapshot: its pages on top of the original snapshot.
+        let api_socket_snapshot = format!("{}.3", temp_api_path(&guest.tmp_dir));
+        let mut snapshot_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_snapshot])
+            .capture_output()
+            .spawn()
+            .unwrap();
+        let snapshot = format!("{snapshots_dir}/1");
+        let r = panic::catch_unwind(|| {
+            restore(&api_socket_snapshot, &snapshot, "", false);
+            assert_eq!(md5("/dev/shm/base"), *base_md5.lock().unwrap());
+            assert_eq!(md5("/dev/shm/new"), *new_md5.lock().unwrap());
+        });
+        stop_daemon();
+        kill_child(&mut snapshot_child);
+        let output = snapshot_child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        let _ = remove_dir_all(offload_dir.as_str());
+        let _ = remove_dir_all(snapshots_dir.as_str());
+        let _ = remove_dir_all(file_snapshot_dir.as_str());
     }
 }
 
