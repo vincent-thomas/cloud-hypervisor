@@ -374,6 +374,11 @@ The exception does not apply once guest RAM that the daemon did not provide
 exists, such as memory hotplugged after the restore or virtio-mem regions.
 Such a VM is only snapshotted once every page is populated.
 
+The reference daemon accepts these snapshots with `--snapshot-socket` and
+`--snapshot-dir` in on demand restore mode. Each snapshot stores the pages the
+daemon populated, a bitmap of them, and the directory it restored from as its
+base. Restoring a snapshot resolves the remaining pages through that base.
+
 ### The daemon protocol
 
 The daemon implements the local live-migration wire protocol defined in

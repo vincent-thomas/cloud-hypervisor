@@ -14,13 +14,14 @@
 //!
 //! Restore (daemon sends): replays those files back to CH. `--resume` resumes
 //! the VM, and `--ondemand` serves pages on demand over the postcopy fault
-//! connection instead of preloading them.
+//! connection instead of preloading them. With `--snapshot-socket`, an on
+//! demand restore also accepts snapshots of the restored VM, which store only
+//! the pages the daemon populated on top of the directory it restored from.
 
 use std::ffi::{CString, NulError};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,20 +29,20 @@ use std::{result, thread};
 
 use clap::{Parser, Subcommand};
 use log::{debug, info};
+use ondemand::{OnDemandSlot, Pager};
 use thiserror::Error;
-use vm_memory::mmap::{MmapRegion, MmapRegionError};
-use vm_memory::{
-    Address, Bytes, FileOffset, GuestAddress, GuestMemoryError, GuestMemoryRegion, GuestRegionMmap,
-    MemoryRegionAddress,
-};
+use vm_memory::GuestMemoryError;
+use vm_memory::mmap::MmapRegionError;
 use vm_migration::MigratableError;
-use vm_migration::protocol::{Command, ConnectionRole, MemoryRange, Request, Response, Status};
+use vm_migration::protocol::{Command, ConnectionRole, Request, Response, Status};
 use vmm::VmMigrationConfig;
 use vmm::api::MigrationMode;
 use vmm::migration::SNAPSHOT_STATE_FILE;
 use vmm::sparse::copy_region;
 use vmm_sys_util::errno;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+
+mod ondemand;
 
 const MIGRATION_CONFIG_FILENAME: &str = "migration_config.json";
 
@@ -113,6 +114,12 @@ enum Error {
     PageFaultUnmapped(u64, u64),
     #[error("Writing a faulted page into guest memory")]
     WriteGuestMemory(#[source] GuestMemoryError),
+    #[error("Querying page residency")]
+    Mincore(#[source] io::Error),
+    #[error("Region at gpa={0:#x} is missing from a snapshot directory")]
+    RegionNotInSnapshot(u64),
+    #[error("Snapshot memory fd for slot {0} is not one this daemon serves")]
+    ForeignMemoryFd(u32),
 }
 
 type Result<T> = result::Result<T, Error>;
@@ -154,6 +161,14 @@ enum Mode {
         /// On demand paging.
         #[arg(long)]
         ondemand: bool,
+        /// With --ondemand, accept snapshots of the restored VM
+        /// (`send-migration` with `memory_mode=memfds`) on this socket.
+        #[arg(long, requires = "snapshot_dir")]
+        snapshot_socket: Option<PathBuf>,
+        /// Directory that snapshots are written to, one numbered
+        /// subdirectory each.
+        #[arg(long, requires = "ondemand")]
+        snapshot_dir: Option<PathBuf>,
     },
 }
 
@@ -168,7 +183,15 @@ fn main() -> Result<()> {
             input_dir,
             resume,
             ondemand,
-        } => run_restore(&socket, &input_dir, resume, ondemand),
+            snapshot_socket,
+            snapshot_dir,
+        } => run_restore(
+            &socket,
+            &input_dir,
+            resume,
+            ondemand,
+            snapshot_socket.zip(snapshot_dir),
+        ),
     }
 }
 
@@ -396,7 +419,13 @@ fn parse_guest_ram_mappings(value: &serde_json::Value) -> Result<Vec<(u32, u64, 
 }
 
 // Restore mode (migration sender).
-fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: bool) -> Result<()> {
+fn run_restore(
+    socket_path: &Path,
+    input_dir: &Path,
+    resume: bool,
+    ondemand: bool,
+    snapshots: Option<(PathBuf, PathBuf)>,
+) -> Result<()> {
     let migration_config_bytes =
         fs::read(input_dir.join(MIGRATION_CONFIG_FILENAME)).map_err(Error::ReadFile)?;
     let mut migration_config: VmMigrationConfig = serde_json::from_slice(&migration_config_bytes)?;
@@ -415,28 +444,17 @@ fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: boo
 
     send_request_expect_ok(&mut stream, Request::start(), "Start")?;
 
+    let chain = ondemand::Chain::load(input_dir)?;
     let mut ondemand_slots: Vec<OnDemandSlot> = Vec::new();
 
     for (slot, gpa, size, file_offset) in slot_info(&migration_config)? {
-        let disk_path = input_dir.join(memory_slot_filename(slot));
-        let memfd = if ondemand {
-            let memfd = create_empty_memfd(file_offset + size, &format!("offload-slot-{slot}"))?;
-            ondemand_slots.push(OnDemandSlot::new(
-                &memfd,
-                gpa,
-                size,
-                file_offset,
-                &disk_path,
-            )?);
-            memfd
+        let memfd = create_empty_memfd(file_offset + size, &format!("offload-slot-{slot}"))?;
+        if ondemand {
+            ondemand_slots.push(OnDemandSlot::new(&memfd, gpa, size, file_offset)?);
         } else {
-            create_memfd_with_contents(
-                &disk_path,
-                file_offset,
-                size,
-                &format!("offload-slot-{slot}"),
-            )?
-        };
+            // Copy sparsely so the memfd keeps the snapshot's holes.
+            chain.populate(gpa, size, &memfd, file_offset)?;
+        }
         send_memory_fd(&mut stream, slot, &memfd)?;
         debug!(
             "restore: sent memory fd for slot {slot} ({size} bytes at fd offset \
@@ -453,20 +471,25 @@ fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: boo
 
     // For on demand (postcopy) restore the fault connection must be serving before
     // CH processes State, so connect it here and serve on its own thread.
+    let mut _snapshot_lock = None;
     let serve_handle = if ondemand {
-        let slots = Arc::new(ondemand_slots);
+        let num_slots = ondemand_slots.len();
+        let pager = Arc::new(Pager::new(ondemand_slots, chain, input_dir)?);
+        if let Some((snapshot_socket, snapshot_dir)) = snapshots {
+            _snapshot_lock = Some(acquire_socket_lock(&snapshot_socket)?);
+            let _ = fs::remove_file(&snapshot_socket);
+            let listener = UnixListener::bind(&snapshot_socket).map_err(Error::BindSocket)?;
+            info!("Offload daemon accepting snapshots at {snapshot_socket:?}");
+            Arc::clone(&pager).serve_snapshots(listener, snapshot_dir);
+        }
         let mut fault_stream = UnixStream::connect(socket_path).map_err(Error::Connect)?;
         ConnectionRole::Fault
             .write_to(&mut fault_stream)
             .map_err(Error::Protocol)?;
-        info!(
-            "offload daemon: connected dedicated fault connection, serving {} slot(s)",
-            slots.len()
-        );
-        let serve_slots = Arc::clone(&slots);
+        info!("offload daemon: connected dedicated fault connection, serving {num_slots} slot(s)");
         let handle = thread::Builder::new()
             .name("offload-fault-serve".to_owned())
-            .spawn(move || serve_page_faults(&mut fault_stream, serve_slots.as_slice()))
+            .spawn(move || pager.serve_page_faults(&mut fault_stream))
             .map_err(Error::SpawnServeThread)?;
         Some(handle)
     } else {
@@ -494,82 +517,6 @@ fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: boo
 
     info!("Restore replay finished");
     Ok(())
-}
-
-/// Per-slot state for serving PageFault requests in on demand mode.
-struct OnDemandSlot {
-    region: GuestRegionMmap,
-    disk: File,
-}
-
-impl OnDemandSlot {
-    fn new(memfd: &File, gpa: u64, size: u64, file_offset: u64, disk_path: &Path) -> Result<Self> {
-        // Map the same memfd CH maps, so our page writes are visible to it.
-        let fo = FileOffset::new(memfd.try_clone().map_err(Error::CloneMemfd)?, file_offset);
-        let mmap = MmapRegion::build(
-            Some(fo),
-            size as usize,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-        )
-        .map_err(Error::Mmap)?;
-        let region = GuestRegionMmap::new(mmap, GuestAddress(gpa)).ok_or(Error::GuestRegion)?;
-        let disk = File::open(disk_path).map_err(Error::ReadFile)?;
-        Ok(Self { region, disk })
-    }
-
-    fn contains(&self, gpa: u64, len: u64) -> bool {
-        let base = self.region.start_addr().raw_value();
-        let end = base + self.region.len();
-        gpa >= base && gpa.saturating_add(len) <= end
-    }
-}
-
-fn serve_page_faults(stream: &mut UnixStream, slots: &[OnDemandSlot]) -> Result<()> {
-    let mut served: u64 = 0;
-    loop {
-        let req = match Request::read_from(stream) {
-            Ok(r) => r,
-            Err(e) => {
-                info!("Serve loop: socket closed after {served} PageFault(s) ({e:?})");
-                return Ok(());
-            }
-        };
-        match req.command() {
-            Command::PageFault => {
-                let range = MemoryRange::read_from(stream).map_err(Error::Protocol)?;
-                served += 1;
-                if served <= 5 || served.is_power_of_two() {
-                    info!(
-                        "PageFault #{served}: gpa={:#x} len={}",
-                        range.gpa, range.length
-                    );
-                }
-                let slot = slots
-                    .iter()
-                    .find(|s| s.contains(range.gpa, range.length))
-                    .ok_or(Error::PageFaultUnmapped(range.gpa, range.length))?;
-                let offset = range.gpa - slot.region.start_addr().raw_value();
-                // Reading a sparse hole returns zeros, so a single read+write
-                // path covers both data and unwritten pages.
-                let mut buf = vec![0u8; range.length as usize];
-                slot.disk
-                    .read_exact_at(&mut buf, offset)
-                    .map_err(Error::CopyMemory)?;
-                slot.region
-                    .write_slice(&buf, MemoryRegionAddress(offset))
-                    .map_err(Error::WriteGuestMemory)?;
-                Response::ok().write_to(stream).map_err(Error::Protocol)?;
-            }
-            #[expect(deprecated)] // last sent in v52
-            Command::Abandon => {
-                info!("Serve loop: received Abandon, exiting");
-                Response::ok().write_to(stream).ok();
-                return Ok(());
-            }
-            c => return Err(Error::UnexpectedCommand(c, "a PageFault")),
-        }
-    }
 }
 
 fn create_empty_memfd(size: u64, name: &str) -> Result<File> {
@@ -617,20 +564,6 @@ fn send_memory_fd(stream: &mut UnixStream, slot: u32, memfd: &File) -> Result<()
         .send_with_fd(&slot.to_le_bytes()[..], memfd.as_raw_fd())
         .map_err(Error::SendMemoryFd)?;
     expect_ok_response(stream, "MemoryFd")
-}
-
-fn create_memfd_with_contents(
-    src_path: &Path,
-    file_offset: u64,
-    size: u64,
-    name: &str,
-) -> Result<File> {
-    // Size the memfd to cover the range CH maps at `file_offset`.
-    let memfd = create_empty_memfd(file_offset + size, name)?;
-    let src = File::open(src_path).map_err(Error::ReadFile)?;
-    // Copy sparsely so the memfd keeps the snapshot's holes.
-    copy_region(&src, 0, &memfd, file_offset, size).map_err(Error::CopyMemory)?;
-    Ok(memfd)
 }
 
 #[cfg(test)]
