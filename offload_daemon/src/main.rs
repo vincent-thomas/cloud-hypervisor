@@ -14,8 +14,11 @@
 //!
 //! Restore (daemon sends): replays those files back to CH. `--resume` resumes
 //! the VM, and `--ondemand` serves pages on demand over the postcopy fault
-//! connection instead of preloading them.
+//! connection instead of preloading them. With `--written-pages`, it also
+//! records the pages CH reports as written (receive-migration
+//! `track_writes=on`) and saves them when CH closes the fault connection.
 
+use std::collections::BTreeMap;
 use std::ffi::{CString, NulError};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -35,7 +38,9 @@ use vm_memory::{
     MemoryRegionAddress,
 };
 use vm_migration::MigratableError;
-use vm_migration::protocol::{Command, ConnectionRole, MemoryRange, Request, Response, Status};
+use vm_migration::protocol::{
+    Command, ConnectionRole, MemoryRange, PageAccess, Request, Response, Status,
+};
 use vmm::VmMigrationConfig;
 use vmm::api::MigrationMode;
 use vmm::migration::SNAPSHOT_STATE_FILE;
@@ -154,6 +159,11 @@ enum Mode {
         /// On demand paging.
         #[arg(long)]
         ondemand: bool,
+        /// Save the guest memory ranges written since the restore to this
+        /// file, as JSON, when CH closes the fault connection. Requires
+        /// `track_writes=on` on CH's receive-migration.
+        #[arg(long, requires = "ondemand")]
+        written_pages: Option<PathBuf>,
     },
 }
 
@@ -168,7 +178,14 @@ fn main() -> Result<()> {
             input_dir,
             resume,
             ondemand,
-        } => run_restore(&socket, &input_dir, resume, ondemand),
+            written_pages,
+        } => run_restore(
+            &socket,
+            &input_dir,
+            resume,
+            ondemand,
+            written_pages.as_deref(),
+        ),
     }
 }
 
@@ -396,7 +413,13 @@ fn parse_guest_ram_mappings(value: &serde_json::Value) -> Result<Vec<(u32, u64, 
 }
 
 // Restore mode (migration sender).
-fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: bool) -> Result<()> {
+fn run_restore(
+    socket_path: &Path,
+    input_dir: &Path,
+    resume: bool,
+    ondemand: bool,
+    written_pages: Option<&Path>,
+) -> Result<()> {
     let migration_config_bytes =
         fs::read(input_dir.join(MIGRATION_CONFIG_FILENAME)).map_err(Error::ReadFile)?;
     let mut migration_config: VmMigrationConfig = serde_json::from_slice(&migration_config_bytes)?;
@@ -489,7 +512,16 @@ fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: boo
 
     if let Some(handle) = serve_handle {
         info!("Offload daemon: waiting for fault serving to finish");
-        handle.join().map_err(|_| Error::ServeThreadPanic)??;
+        let written = handle.join().map_err(|_| Error::ServeThreadPanic)??;
+        if let Some(path) = written_pages {
+            let ranges = merge_written_pages(&written);
+            info!(
+                "Saving {} written page(s) as {} range(s) to {path:?}",
+                written.len(),
+                ranges.len()
+            );
+            fs::write(path, serde_json::to_vec(&ranges)?).map_err(Error::WriteFile)?;
+        }
     }
 
     info!("Restore replay finished");
@@ -525,19 +557,32 @@ impl OnDemandSlot {
     }
 }
 
-fn serve_page_faults(stream: &mut UnixStream, slots: &[OnDemandSlot]) -> Result<()> {
+/// Serve PageFault requests until CH closes the connection. Returns the pages
+/// CH reported as written, as a map from GPA to length.
+fn serve_page_faults(
+    stream: &mut UnixStream,
+    slots: &[OnDemandSlot],
+) -> Result<BTreeMap<u64, u64>> {
     let mut served: u64 = 0;
+    let mut written = BTreeMap::new();
     loop {
         let req = match Request::read_from(stream) {
             Ok(r) => r,
             Err(e) => {
-                info!("Serve loop: socket closed after {served} PageFault(s) ({e:?})");
-                return Ok(());
+                info!(
+                    "Serve loop: socket closed after {served} PageFault(s), {} page(s) written ({e:?})",
+                    written.len()
+                );
+                return Ok(written);
             }
         };
         match req.command() {
             Command::PageFault => {
+                let access = req.page_access().map_err(Error::Protocol)?;
                 let range = MemoryRange::read_from(stream).map_err(Error::Protocol)?;
+                if access == PageAccess::Write {
+                    written.insert(range.gpa, range.length);
+                }
                 served += 1;
                 if served <= 5 || served.is_power_of_two() {
                     info!(
@@ -562,19 +607,33 @@ fn serve_page_faults(stream: &mut UnixStream, slots: &[OnDemandSlot]) -> Result<
                 Response::ok().write_to(stream).map_err(Error::Protocol)?;
             }
             Command::PageWritten => {
-                // The page was already served; only acknowledge the write.
-                MemoryRange::read_from(stream).map_err(Error::Protocol)?;
+                // The page was already served: record the write, and leave
+                // the page content alone.
+                let range = MemoryRange::read_from(stream).map_err(Error::Protocol)?;
+                written.insert(range.gpa, range.length);
                 Response::ok().write_to(stream).map_err(Error::Protocol)?;
             }
             #[expect(deprecated)] // last sent in v52
             Command::Abandon => {
                 info!("Serve loop: received Abandon, exiting");
                 Response::ok().write_to(stream).ok();
-                return Ok(());
+                return Ok(written);
             }
             c => return Err(Error::UnexpectedCommand(c, "a PageFault")),
         }
     }
+}
+
+/// Merge written pages, keyed by GPA, into the smallest list of ranges.
+fn merge_written_pages(written: &BTreeMap<u64, u64>) -> Vec<MemoryRange> {
+    let mut ranges: Vec<MemoryRange> = Vec::new();
+    for (&gpa, &length) in written {
+        match ranges.last_mut() {
+            Some(last) if last.gpa + last.length == gpa => last.length += length,
+            _ => ranges.push(MemoryRange { gpa, length }),
+        }
+    }
+    ranges
 }
 
 fn create_empty_memfd(size: u64, name: &str) -> Result<File> {
@@ -643,6 +702,35 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn test_merge_written_pages() {
+        let written = BTreeMap::from([
+            (0x1000, 0x1000),
+            (0x2000, 0x1000),
+            (0x4000, 0x1000),
+            (0x20_0000, 0x20_0000),
+            (0x40_0000, 0x1000),
+        ]);
+        assert_eq!(
+            merge_written_pages(&written),
+            vec![
+                MemoryRange {
+                    gpa: 0x1000,
+                    length: 0x2000
+                },
+                MemoryRange {
+                    gpa: 0x4000,
+                    length: 0x1000
+                },
+                MemoryRange {
+                    gpa: 0x20_0000,
+                    length: 0x20_1000
+                },
+            ]
+        );
+        assert!(merge_written_pages(&BTreeMap::new()).is_empty());
+    }
 
     #[test]
     fn test_memory_slot_filename() {
