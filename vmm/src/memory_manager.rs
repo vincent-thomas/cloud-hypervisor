@@ -44,7 +44,7 @@ use vm_memory::{
     Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend,
     GuestMemoryError, GuestMemoryRegion, GuestUsize, MmapRegion,
 };
-use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
+use vm_migration::protocol::{MemoryRange, MemoryRangeTable, PageAccess};
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
     UffdError,
@@ -1513,6 +1513,11 @@ impl MemoryManager {
 
                 let fault_addr = msg.pf_address;
                 let minor_fault = msg.pf_flags & userfaultfd::UFFD_PAGEFAULT_FLAG_MINOR != 0;
+                let access = if msg.pf_flags & userfaultfd::UFFD_PAGEFAULT_FLAG_WRITE != 0 {
+                    PageAccess::Write
+                } else {
+                    PageAccess::Read
+                };
 
                 let (range_idx, page_idx) = fault_uffd.locate(fault_addr).ok_or_else(|| {
                     io::Error::other(format!(
@@ -1585,7 +1590,7 @@ impl MemoryManager {
                     continue;
                 }
 
-                let result = source.resolve(fault_uffd.fd(), range, page_idx);
+                let result = source.resolve(fault_uffd.fd(), range, page_idx, access);
 
                 {
                     let mut loading = pages_loading.lock().unwrap();
@@ -1713,7 +1718,7 @@ impl MemoryManager {
                 continue 'outer;
             }
 
-            let result = source.resolve(uffd_fd, range, current_page_idx);
+            let result = source.resolve(uffd_fd, range, current_page_idx, PageAccess::Read);
 
             {
                 let mut loading = pages_loading.lock().unwrap();
@@ -3977,6 +3982,7 @@ mod tests {
             _uffd_fd: BorrowedFd<'_>,
             range: &UffdRange,
             page_idx: u64,
+            _access: PageAccess,
         ) -> Result<(), io::Error> {
             self.attempts
                 .lock()

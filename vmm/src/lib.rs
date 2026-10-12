@@ -1959,7 +1959,8 @@ impl Vmm {
     }
 
     /// Serve `Command::PageFault` requests from local guest memory on the fault
-    /// connection until the destination closes it. Runs on its own thread.
+    /// connection until the destination closes it, and acknowledge
+    /// `Command::PageWritten` reports. Runs on its own thread.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "runs on a dedicated thread and must own its arguments"
@@ -2020,6 +2021,12 @@ impl Vmm {
                     socket
                         .write_all(&buf[..len])
                         .map_err(MigratableError::MigrateSocket)?;
+                }
+                Command::PageWritten => {
+                    // This VM keeps no diff of the destination's memory, so a
+                    // write report only needs an acknowledgement.
+                    MemoryRange::read_from(&mut socket)?;
+                    Response::ok().write_to(&mut socket)?;
                 }
                 c => {
                     return Err(MigratableError::MigrateSend(anyhow!(

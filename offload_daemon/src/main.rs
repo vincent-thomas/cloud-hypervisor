@@ -561,6 +561,11 @@ fn serve_page_faults(stream: &mut UnixStream, slots: &[OnDemandSlot]) -> Result<
                     .map_err(Error::WriteGuestMemory)?;
                 Response::ok().write_to(stream).map_err(Error::Protocol)?;
             }
+            Command::PageWritten => {
+                // The page was already served; only acknowledge the write.
+                MemoryRange::read_from(stream).map_err(Error::Protocol)?;
+                Response::ok().write_to(stream).map_err(Error::Protocol)?;
+            }
             #[expect(deprecated)] // last sent in v52
             Command::Abandon => {
                 info!("Serve loop: received Abandon, exiting");

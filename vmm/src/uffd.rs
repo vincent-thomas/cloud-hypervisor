@@ -19,7 +19,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::{fmt, thread};
 
-use vm_migration::protocol::{MemoryRange, Request, Response, Status};
+use vm_migration::protocol::{MemoryRange, PageAccess, Request, Response, Status};
 
 use crate::migration::transport::SocketStream;
 use crate::userfaultfd;
@@ -318,11 +318,13 @@ impl Uffd {
 
 /// Provider of guest-memory page contents for a UFFD handler.
 pub(crate) trait UffdMemorySource: Send {
+    /// Install the page, faulted in by `access`, into `uffd_fd`.
     fn resolve(
         &mut self,
         uffd_fd: BorrowedFd<'_>,
         range: &UffdRange,
         page_idx: u64,
+        access: PageAccess,
     ) -> Result<(), io::Error>;
 
     fn requires_uffd_minor_mode(&self) -> bool;
@@ -349,6 +351,7 @@ impl UffdMemorySource for FileUffdMemorySource {
         uffd_fd: BorrowedFd<'_>,
         range: &UffdRange,
         page_idx: u64,
+        _access: PageAccess,
     ) -> Result<(), io::Error> {
         let page_size = range.page_size as usize;
         let page_addr = range.page_addr(page_idx);
@@ -396,8 +399,8 @@ impl SocketUffdMemorySource {
 
     /// Returns the length of the inline page payload the peer is about to send
     /// (0 when the page was written directly into shared memory).
-    fn request_page(&mut self, gpa: u64, len: u64) -> Result<u64, io::Error> {
-        Request::page_fault()
+    fn request_page(&mut self, gpa: u64, len: u64, access: PageAccess) -> Result<u64, io::Error> {
+        Request::page_fault(access)
             .write_to(&mut self.stream)
             .map_err(io_other)?;
         MemoryRange { gpa, length: len }
@@ -420,12 +423,13 @@ impl UffdMemorySource for SocketUffdMemorySource {
         uffd_fd: BorrowedFd<'_>,
         range: &UffdRange,
         page_idx: u64,
+        access: PageAccess,
     ) -> Result<(), io::Error> {
         let page_size = range.page_size;
         let page_addr = range.page_addr(page_idx);
         let page_gpa = range.page_source_offset(page_idx);
 
-        let resp_len = self.request_page(page_gpa, page_size)?;
+        let resp_len = self.request_page(page_gpa, page_size, access)?;
 
         if self.shared_backing {
             if resp_len != 0 {

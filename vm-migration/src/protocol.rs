@@ -131,6 +131,7 @@ use crate::bitpos_iterator::BitposIteratorExt;
 ///     StateReceived --> Completed: Complete
 ///     StateReceived --> Completed: CompletePaused
 ///     Completed --> Completed: PageFault
+///     Completed --> Completed: PageWritten
 /// ```
 ///
 /// [live-migration protocol]: super::protocol
@@ -154,7 +155,40 @@ pub enum Command {
     CompletePaused = 8,
     /// Request a page to be faulted in. The page content can be sent
     /// through the response or simply written to the shared memory.
+    ///
+    /// The command headers carry the [`PageAccess`] that faulted.
     PageFault = 9,
+    /// Report that the guest wrote to a page that was already faulted in.
+    /// The peer must not send or write the page content: it only records
+    /// the write and acknowledges it. The write is held until the response
+    /// arrives, so the peer has seen every write before it captures memory.
+    PageWritten = 10,
+}
+
+/// The access that caused a [`Command::PageFault`].
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub enum PageAccess {
+    /// A read, or an access the receiver could not classify. Senders that
+    /// predate this field leave the headers zeroed, which decodes as `Read`.
+    #[default]
+    Read = 0,
+    /// A write: the page is modified as soon as it is faulted in.
+    Write = 1,
+}
+
+impl TryFrom<u8> for PageAccess {
+    type Error = MigratableError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PageAccess::Read),
+            1 => Ok(PageAccess::Write),
+            _ => Err(MigratableError::MigrateReceive(anyhow!(
+                "unknown page access: {value}"
+            ))),
+        }
+    }
 }
 
 /// Role announced as the first message on an additional migration connection.
@@ -267,8 +301,19 @@ impl Request {
     }
 
     /// PageFault request always carries a single `MemoryRange`.
-    pub fn page_fault() -> Self {
-        Self::new(Command::PageFault, size_of::<MemoryRange>() as u64)
+    pub fn page_fault(access: PageAccess) -> Self {
+        let mut command_headers = [0; 6];
+        command_headers[0] = access as u8;
+        Self {
+            command: Command::PageFault,
+            command_headers,
+            length: size_of::<MemoryRange>() as u64,
+        }
+    }
+
+    /// PageWritten request always carries a single `MemoryRange`.
+    pub fn page_written() -> Self {
+        Self::new(Command::PageWritten, size_of::<MemoryRange>() as u64)
     }
 
     pub fn command(&self) -> Command {
@@ -301,6 +346,18 @@ impl Request {
         }
 
         Ok(sender_version)
+    }
+
+    /// Returns the access that caused a `PageFault` request.
+    pub fn page_access(&self) -> Result<PageAccess, MigratableError> {
+        assert_eq!(
+            self.command(),
+            Command::PageFault,
+            "page_access() must only be called for PageFault requests",
+        );
+
+        // The access is stored in the first header byte, the remaining bytes are ignored.
+        PageAccess::try_from(self.command_headers[0])
     }
 
     pub fn read_from(fd: &mut dyn Read) -> Result<Request, MigratableError> {
@@ -650,7 +707,8 @@ mod tests {
     use std::io::Cursor;
 
     use crate::protocol::{
-        CURRENT_PROTOCOL_VERSION, Command, ConnectionRole, MemoryRange, MemoryRangeTable, Request,
+        CURRENT_PROTOCOL_VERSION, Command, ConnectionRole, MemoryRange, MemoryRangeTable,
+        PageAccess, Request,
     };
 
     #[test]
@@ -681,25 +739,56 @@ mod tests {
 
     #[test]
     fn test_page_fault_request_roundtrip() {
-        let req = Request::page_fault();
-        assert_eq!(req.command(), Command::PageFault);
-        assert_eq!(req.length(), size_of::<MemoryRange>() as u64);
+        for access in [PageAccess::Read, PageAccess::Write] {
+            let req = Request::page_fault(access);
+            assert_eq!(req.command(), Command::PageFault);
+            assert_eq!(req.length(), size_of::<MemoryRange>() as u64);
 
-        let range = MemoryRange {
-            gpa: 0x4000,
-            length: 0x1000,
+            let range = MemoryRange {
+                gpa: 0x4000,
+                length: 0x1000,
+            };
+
+            let mut buf = Vec::new();
+            req.write_to(&mut buf).unwrap();
+            range.write_to(&mut buf).unwrap();
+
+            let mut cursor = Cursor::new(buf);
+            let parsed_req = Request::read_from(&mut cursor).unwrap();
+            assert_eq!(parsed_req.command(), Command::PageFault);
+            assert_eq!(parsed_req.length(), size_of::<MemoryRange>() as u64);
+            assert_eq!(parsed_req.page_access().unwrap(), access);
+            let parsed_range = MemoryRange::read_from(&mut cursor).unwrap();
+            assert_eq!(parsed_range, range);
+        }
+    }
+
+    #[test]
+    fn test_page_fault_zeroed_headers_decode_as_read() {
+        // Senders that predate the access field send zeroed headers.
+        let req = Request::new(Command::PageFault, size_of::<MemoryRange>() as u64);
+        assert_eq!(req.page_access().unwrap(), PageAccess::Read);
+    }
+
+    #[test]
+    fn test_page_fault_unknown_access_is_rejected() {
+        let request = Request {
+            command: Command::PageFault,
+            command_headers: [255, 0, 0, 0, 0, 0],
+            length: size_of::<MemoryRange>() as u64,
         };
+        request.page_access().unwrap_err();
+    }
 
+    #[test]
+    fn test_page_written_request_roundtrip() {
+        let req = Request::page_written();
         let mut buf = Vec::new();
         req.write_to(&mut buf).unwrap();
-        range.write_to(&mut buf).unwrap();
 
-        let mut cursor = Cursor::new(buf);
-        let parsed_req = Request::read_from(&mut cursor).unwrap();
-        assert_eq!(parsed_req.command(), Command::PageFault);
+        let parsed_req = Request::read_from(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(parsed_req.command(), Command::PageWritten);
         assert_eq!(parsed_req.length(), size_of::<MemoryRange>() as u64);
-        let parsed_range = MemoryRange::read_from(&mut cursor).unwrap();
-        assert_eq!(parsed_range, range);
     }
 
     #[test]
