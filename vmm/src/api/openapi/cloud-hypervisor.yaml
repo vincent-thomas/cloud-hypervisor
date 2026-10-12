@@ -1738,6 +1738,10 @@ components:
           type: boolean
           default: true
           description: Enable the background thread for faulting all remaining pages.
+        track_writes:
+          type: boolean
+          default: false
+          description: Report each page's first write to the postcopy sender, so it can track which pages the guest modified.
 
     MigrationMode:
       type: string

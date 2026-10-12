@@ -65,6 +65,17 @@ use crate::uffd::{
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
 use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, prefault, userfaultfd};
 
+/// How a UFFD handler serves guest memory.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UffdHandlerOptions {
+    /// Fetch every remaining page in the background.
+    pub background_prefault: bool,
+    /// Report each page's first write to the memory source. Pages faulted in
+    /// by a read are mapped write-protected, and the handler keeps running
+    /// after the background prefault to serve write-protect faults.
+    pub track_writes: bool,
+}
+
 struct UffdHandler {
     stop_event: EventFd,
     result_rx: Receiver<Result<(), io::Error>>,
@@ -1069,6 +1080,7 @@ impl MemoryManager {
                 o
             },
             source.requires_uffd_minor_mode(),
+            false,
         )?
         else {
             return Ok(());
@@ -1106,7 +1118,11 @@ impl MemoryManager {
             }
         }
 
-        self.spawn_uffd_handler(uffd, None, served_bitmap, source, exit_evt, true)?;
+        let options = UffdHandlerOptions {
+            background_prefault: true,
+            track_writes: false,
+        };
+        self.spawn_uffd_handler(uffd, None, served_bitmap, source, exit_evt, options)?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
     }
@@ -1117,7 +1133,7 @@ impl MemoryManager {
         &mut self,
         saved_regions: &MemoryRangeTable,
         shared_backing: bool,
-        background_prefault: bool,
+        options: UffdHandlerOptions,
         socket: SocketStream,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
@@ -1131,8 +1147,12 @@ impl MemoryManager {
             Box::new(SocketUffdMemorySource::new(socket, shared_backing));
 
         // PageFault uses the GPA as the page identifier on the wire.
-        let Some(uffd) =
-            self.prepare_uffd(saved_regions, |r| r.gpa, source.requires_uffd_minor_mode())?
+        let Some(uffd) = self.prepare_uffd(
+            saved_regions,
+            |r| r.gpa,
+            source.requires_uffd_minor_mode(),
+            options.track_writes,
+        )?
         else {
             return Ok(());
         };
@@ -1147,23 +1167,25 @@ impl MemoryManager {
                 )
             })
             .collect();
-        info!("UFFD: postcopy background prefault {background_prefault}");
+        info!("UFFD: postcopy {options:?}");
         self.spawn_uffd_handler(
             uffd,
             Some(socket_fd),
             served_bitmap,
             source,
             exit_evt,
-            background_prefault,
+            options,
         )
     }
 
-    /// Create a UFFD fd and register every range.
+    /// Create a UFFD fd and register every range, for write-protect faults
+    /// too when `write_protect` is set.
     fn prepare_uffd<F>(
         &mut self,
         saved_regions: &MemoryRangeTable,
         mut source_offset_for: F,
         uffd_requires_minor_mode: bool,
+        write_protect: bool,
     ) -> Result<Option<Uffd>, Error>
     where
         F: FnMut(&MemoryRange) -> u64,
@@ -1173,7 +1195,8 @@ impl MemoryManager {
         }
 
         let guest_memory = self.guest_memory.memory();
-        let required_uffd_features = self.required_uffd_features(uffd_requires_minor_mode);
+        let required_uffd_features =
+            self.required_uffd_features(uffd_requires_minor_mode, write_protect);
 
         // SAFETY: FFI call. Trivially safe.
         let base_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
@@ -1208,6 +1231,7 @@ impl MemoryManager {
                 host_addr,
                 range.length,
                 uffd_requires_minor_mode,
+                write_protect,
             )
             .map_err(|e| UffdError::Register {
                 addr: host_addr,
@@ -1215,11 +1239,14 @@ impl MemoryManager {
                 source: e,
             })?;
 
-            let required_ioctls = if uffd_requires_minor_mode {
+            let mut required_ioctls = if uffd_requires_minor_mode {
                 userfaultfd::UFFD_API_RANGE_IOCTLS_MINOR
             } else {
                 userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
             };
+            if write_protect {
+                required_ioctls |= userfaultfd::UFFD_API_RANGE_IOCTLS_WP;
+            }
 
             if ioctls & required_ioctls != required_ioctls {
                 return Err(UffdError::MissingIoctlSupport {
@@ -1256,7 +1283,7 @@ impl MemoryManager {
         served_bitmap: Vec<AtomicBitmap>,
         source: Box<dyn UffdMemorySource>,
         exit_evt: &EventFd,
-        background_prefault: bool,
+        options: UffdHandlerOptions,
     ) -> Result<(), Error> {
         info!(
             "UFFD: spawning handler for {} region(s)",
@@ -1283,7 +1310,7 @@ impl MemoryManager {
                         served_bitmap,
                         &ready_tx,
                         &thread_prefault_complete,
-                        background_prefault,
+                        options,
                     );
 
                     if result.is_err() && thread_stop_event.read().is_ok() {
@@ -1327,7 +1354,7 @@ impl MemoryManager {
         Ok(())
     }
 
-    fn required_uffd_features(&self, uffd_requires_minor_mode: bool) -> u64 {
+    fn required_uffd_features(&self, uffd_requires_minor_mode: bool, write_protect: bool) -> u64 {
         let mut features = 0u64;
         if self.memory_zones.values().any(|z| z.shared || !z.hugepages) {
             features |= userfaultfd::UFFD_FEATURE_MISSING_SHMEM;
@@ -1340,6 +1367,12 @@ impl MemoryManager {
             if uffd_requires_minor_mode {
                 features |= userfaultfd::UFFD_FEATURE_MINOR_HUGETLBFS;
             }
+        }
+        if write_protect {
+            // Guest RAM may be backed by the sender's memfds whatever the zone
+            // config says, so always require shmem support (Linux 5.19+).
+            features |= userfaultfd::UFFD_FEATURE_PAGEFAULT_FLAG_WP
+                | userfaultfd::UFFD_FEATURE_WP_HUGETLBFS_SHMEM;
         }
         features
     }
@@ -1404,18 +1437,20 @@ impl MemoryManager {
         served_bitmap: Vec<AtomicBitmap>,
         ready_tx: &SyncSender<()>,
         prefault_complete: &AtomicBool,
-        background_prefault: bool,
+        options: UffdHandlerOptions,
     ) -> Result<(), io::Error> {
+        let track_writes = options.track_writes;
         let vmm_uffd = &uffds[0];
         let ranges = vmm_uffd.ranges();
 
         let total_pages: u64 = ranges.iter().map(UffdRange::num_pages).sum();
         let mut pages_served: u64 = 0;
         let mut pages_prefaulted: u64 = 0;
+        let mut pages_written: u64 = 0;
 
         let pages_loading: Mutex<HashSet<(usize, u64)>> = Mutex::new(HashSet::new());
 
-        let mut prefault_active = background_prefault && !ranges.is_empty();
+        let mut prefault_active = options.background_prefault && !ranges.is_empty();
         let mut source_failed = false;
         let mut range_idx = 0;
         let mut page_idx = 0;
@@ -1526,6 +1561,30 @@ impl MemoryManager {
                 })?;
                 let range = &fault_uffd.ranges()[range_idx];
 
+                if msg.pf_flags & userfaultfd::UFFD_PAGEFAULT_FLAG_WP != 0 {
+                    // First write to a page mapped write-protected. The
+                    // source records it before the write is let through.
+                    // Once the source failed, the VM is exiting and the
+                    // source's record is incomplete anyway, so let the write
+                    // through rather than keep the writer blocked.
+                    if !source_failed {
+                        match source.report_written(range, page_idx) {
+                            Ok(()) => pages_written += 1,
+                            Err(e) => {
+                                error!(
+                                    "UFFD handler: failed to report a write at {:#x}: {e}",
+                                    range.page_addr(page_idx)
+                                );
+                                exit_evt.write(1).ok();
+                                prefault_active = false;
+                                source_failed = true;
+                            }
+                        }
+                    }
+                    uffd::unprotect(fault_uffd.fd(), range.page_addr(page_idx), range.page_size)?;
+                    continue;
+                }
+
                 if source_failed {
                     Self::uffd_poison_page(fault_uffd.fd(), range, page_idx)?;
                     continue;
@@ -1573,10 +1632,13 @@ impl MemoryManager {
                 if served_minor {
                     // The backing page is already in the page cache. A
                     // minor fault only needs the page mapped into this VMA.
+                    // When tracking writes, a write retries into a
+                    // write-protect fault and is reported there.
                     uffd::uffd_continue(
                         fault_uffd.fd(),
                         range.page_addr(page_idx),
                         range.page_size,
+                        track_writes,
                     )
                     .or_else(|e| {
                         if e.raw_os_error() == Some(libc::EEXIST) {
@@ -1590,7 +1652,11 @@ impl MemoryManager {
                     continue;
                 }
 
-                let result = source.resolve(fault_uffd.fd(), range, page_idx, access);
+                // A write fault reports the write in the PageFault itself,
+                // so only pages faulted in by a read are write-protected.
+                let write_protect = track_writes && access == PageAccess::Read;
+                let result =
+                    source.resolve(fault_uffd.fd(), range, page_idx, access, write_protect);
 
                 {
                     let mut loading = pages_loading.lock().unwrap();
@@ -1624,6 +1690,7 @@ impl MemoryManager {
                         vmm_uffd.fd(),
                         ranges[range_idx].page_addr(page_idx),
                         range.page_size,
+                        track_writes,
                     )
                     .or_else(|e| {
                         if e.raw_os_error() == Some(libc::EEXIST) {
@@ -1649,16 +1716,21 @@ impl MemoryManager {
                 &mut source,
                 &served_bitmap,
                 &pages_loading,
+                track_writes,
             ) {
                 Ok(0) => {
                     let elapsed = prefault_start.elapsed();
                     info!(
                         "UFFD handler: prefault done in {elapsed:.3?} — \
                          prefaulted={pages_prefaulted} served={pages_served} \
-                         total={total_pages}"
+                         written={pages_written} total={total_pages}"
                     );
                     prefault_complete.store(true, Ordering::Release);
-                    return Ok(());
+                    if !track_writes {
+                        return Ok(());
+                    }
+                    // Keep serving write-protect faults.
+                    prefault_active = false;
                 }
                 Ok(prefaulted) => pages_prefaulted += prefaulted,
                 Err(e) => {
@@ -1670,6 +1742,7 @@ impl MemoryManager {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn uffd_prefault(
         uffd_fd: BorrowedFd,
         range_idx: &mut usize,
@@ -1678,6 +1751,7 @@ impl MemoryManager {
         source: &mut Box<dyn UffdMemorySource>,
         served_bitmap: &[AtomicBitmap],
         pages_loading: &Mutex<HashSet<(usize, u64)>>,
+        write_protect: bool,
     ) -> Result<u64, io::Error> {
         let mut current_page_idx = *page_idx;
         let mut current_range_idx = *range_idx;
@@ -1718,7 +1792,13 @@ impl MemoryManager {
                 continue 'outer;
             }
 
-            let result = source.resolve(uffd_fd, range, current_page_idx, PageAccess::Read);
+            let result = source.resolve(
+                uffd_fd,
+                range,
+                current_page_idx,
+                PageAccess::Read,
+                write_protect,
+            );
 
             {
                 let mut loading = pages_loading.lock().unwrap();
@@ -3983,6 +4063,7 @@ mod tests {
             range: &UffdRange,
             page_idx: u64,
             _access: PageAccess,
+            _write_protect: bool,
         ) -> Result<(), io::Error> {
             self.attempts
                 .lock()
@@ -3994,6 +4075,10 @@ mod tests {
                 return Err(io::Error::other("test source failure"));
             }
 
+            Ok(())
+        }
+
+        fn report_written(&mut self, _range: &UffdRange, _page_idx: u64) -> Result<(), io::Error> {
             Ok(())
         }
 
@@ -4058,6 +4143,7 @@ mod tests {
                 &mut source,
                 &served_bitmap,
                 &pages_loading,
+                false,
             )
             .unwrap(),
             1
@@ -4073,6 +4159,7 @@ mod tests {
                 &mut source,
                 &served_bitmap,
                 &pages_loading,
+                false,
             )
             .unwrap(),
             1
@@ -4088,6 +4175,7 @@ mod tests {
                 &mut source,
                 &served_bitmap,
                 &pages_loading,
+                false,
             )
             .unwrap(),
             0
@@ -4127,6 +4215,7 @@ mod tests {
             &mut source,
             &served_bitmap,
             &pages_loading,
+            false,
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "test source failure");
@@ -4143,6 +4232,7 @@ mod tests {
                 &mut source,
                 &served_bitmap,
                 &pages_loading,
+                false,
             )
             .unwrap(),
             1

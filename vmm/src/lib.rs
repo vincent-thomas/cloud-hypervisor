@@ -58,7 +58,7 @@ use crate::coredump::GuestDebuggable;
 use crate::device_manager::DeviceManager;
 use crate::landlock::Landlock;
 use crate::locked_unix_listener::LockedUnixListener;
-use crate::memory_manager::{MemoryManager, MemoryRangePolicy};
+use crate::memory_manager::{MemoryManager, MemoryRangePolicy, UffdHandlerOptions};
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
 use crate::migration::transport::{
@@ -737,8 +737,8 @@ struct ReceiveMigrationConfiguredData {
     /// The memory transfer mode announced by the sender in the received
     /// [`VmMigrationConfig`].
     memory_mode: MigrationMode,
-    /// Enable the background thread for faulting all remaining pages.
-    background_fetch_pages: bool,
+    /// How the UFFD handler serves postcopy faults.
+    uffd_options: UffdHandlerOptions,
 }
 
 /// The receiver's state machine behind the migration protocol.
@@ -1009,6 +1009,15 @@ impl Vmm {
                 let shared_backing = !memory_files.is_empty();
                 let (memory_manager, memory_mode) =
                     self.vm_receive_config(req, socket, memory_files, receive_data_migration)?;
+                // Only a postcopy sender serves faults, so only it can be told
+                // about writes.
+                if receive_data_migration.track_writes
+                    && !matches!(memory_mode, MigrationMode::Postcopy)
+                {
+                    return Err(MigratableError::MigrateReceive(anyhow!(
+                        "track_writes requires a postcopy sender, got {memory_mode:?}"
+                    )));
+                }
                 let guest_memory = memory_manager.lock().unwrap().guest_memory();
                 // Create the additional-connection receiver even in the single-connection case.
                 // At this point the receiver does not know whether the sender will use extra TCP
@@ -1031,7 +1040,10 @@ impl Vmm {
                     shared_backing,
                     fault_rx,
                     memory_mode,
-                    background_fetch_pages: receive_data_migration.background_fetch_pages,
+                    uffd_options: UffdHandlerOptions {
+                        background_prefault: receive_data_migration.background_fetch_pages,
+                        track_writes: receive_data_migration.track_writes,
+                    },
                 })
             };
 
@@ -1232,7 +1244,7 @@ impl Vmm {
                 .start_postcopy_serving(
                     &saved_regions,
                     shared_backing,
-                    config_data.background_fetch_pages,
+                    config_data.uffd_options,
                     fault_stream,
                     &self.exit_evt,
                 )
@@ -4192,6 +4204,7 @@ mod tests {
             iommufd_fd,
             zone_updates: vec![],
             background_fetch_pages: true,
+            track_writes: false,
         }
     }
 

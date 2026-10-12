@@ -140,18 +140,22 @@ pub(crate) fn create(required_features: u64) -> Result<OwnedFd, Error> {
     Ok(fd)
 }
 
-/// Register a memory range for missing-page fault handling.
+/// Register a memory range for missing-page fault handling, and for
+/// write-protect faults when `write_protect` is set.
 pub(crate) fn register(
     fd: BorrowedFd<'_>,
     addr: u64,
     len: u64,
     uffd_requires_minor_mode: bool,
+    write_protect: bool,
 ) -> Result<u64, Error> {
-    let mode = if uffd_requires_minor_mode {
-        userfaultfd::UFFDIO_REGISTER_MODE_MISSING | userfaultfd::UFFDIO_REGISTER_MODE_MINOR
-    } else {
-        userfaultfd::UFFDIO_REGISTER_MODE_MISSING
-    };
+    let mut mode = userfaultfd::UFFDIO_REGISTER_MODE_MISSING;
+    if uffd_requires_minor_mode {
+        mode |= userfaultfd::UFFDIO_REGISTER_MODE_MINOR;
+    }
+    if write_protect {
+        mode |= userfaultfd::UFFDIO_REGISTER_MODE_WP;
+    }
 
     let mut reg = UffdioRegister {
         range_start: addr,
@@ -173,13 +177,24 @@ pub(crate) fn register(
     Ok(reg.ioctls)
 }
 
-/// Resolve a page fault by copying data into the faulted address.
-pub(crate) fn copy(fd: BorrowedFd<'_>, dst: u64, src: *const u8, len: u64) -> Result<(), Error> {
+/// Resolve a page fault by copying data into the faulted address. With
+/// `write_protect`, the page is mapped write-protected.
+pub(crate) fn copy(
+    fd: BorrowedFd<'_>,
+    dst: u64,
+    src: *const u8,
+    len: u64,
+    write_protect: bool,
+) -> Result<(), Error> {
     let mut cp = UffdioCopy {
         dst,
         src: src as u64,
         len,
-        mode: 0,
+        mode: if write_protect {
+            userfaultfd::UFFDIO_COPY_MODE_WP
+        } else {
+            0
+        },
         copy: 0,
     };
     loop {
@@ -203,12 +218,22 @@ pub(crate) fn copy(fd: BorrowedFd<'_>, dst: u64, src: *const u8, len: u64) -> Re
     }
 }
 
-/// Resolves a minor page fault by installing PTEs for a range.
-pub(crate) fn uffd_continue(fd: BorrowedFd<'_>, dst: u64, len: u64) -> Result<(), Error> {
+/// Resolves a minor page fault by installing PTEs for a range. With
+/// `write_protect`, the PTEs are write-protected.
+pub(crate) fn uffd_continue(
+    fd: BorrowedFd<'_>,
+    dst: u64,
+    len: u64,
+    write_protect: bool,
+) -> Result<(), Error> {
     let mut cont = UffdioContinue {
         range_start: dst,
         range_len: len,
-        mode: 0,
+        mode: if write_protect {
+            userfaultfd::UFFDIO_CONTINUE_MODE_WP
+        } else {
+            0
+        },
         mapped: 0,
     };
     loop {
@@ -243,6 +268,12 @@ struct UffdioPoison {
     range: UffdioRange,
     mode: u64,
     updated: i64,
+}
+
+#[repr(C)]
+struct UffdioWriteprotect {
+    range: UffdioRange,
+    mode: u64,
 }
 
 /// A guest memory range registered with userfaultfd, plus where its bytes
@@ -318,14 +349,20 @@ impl Uffd {
 
 /// Provider of guest-memory page contents for a UFFD handler.
 pub(crate) trait UffdMemorySource: Send {
-    /// Install the page, faulted in by `access`, into `uffd_fd`.
+    /// Install the page, faulted in by `access`, into `uffd_fd`. With
+    /// `write_protect`, the page is mapped write-protected.
     fn resolve(
         &mut self,
         uffd_fd: BorrowedFd<'_>,
         range: &UffdRange,
         page_idx: u64,
         access: PageAccess,
+        write_protect: bool,
     ) -> Result<(), io::Error>;
+
+    /// Report that the guest wrote to a page this source already resolved.
+    /// Returns once the write is recorded.
+    fn report_written(&mut self, range: &UffdRange, page_idx: u64) -> Result<(), io::Error>;
 
     fn requires_uffd_minor_mode(&self) -> bool;
 }
@@ -352,6 +389,7 @@ impl UffdMemorySource for FileUffdMemorySource {
         range: &UffdRange,
         page_idx: u64,
         _access: PageAccess,
+        write_protect: bool,
     ) -> Result<(), io::Error> {
         let page_size = range.page_size as usize;
         let page_addr = range.page_addr(page_idx);
@@ -363,7 +401,13 @@ impl UffdMemorySource for FileUffdMemorySource {
         self.file
             .read_exact_at(&mut self.buf[..page_size], file_pos)?;
 
-        match copy(uffd_fd, page_addr, self.buf.as_ptr(), range.page_size) {
+        match copy(
+            uffd_fd,
+            page_addr,
+            self.buf.as_ptr(),
+            range.page_size,
+            write_protect,
+        ) {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                 // Installed concurrently. Wake any blocked threads.
@@ -374,6 +418,13 @@ impl UffdMemorySource for FileUffdMemorySource {
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn report_written(&mut self, _range: &UffdRange, _page_idx: u64) -> Result<(), io::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a snapshot file cannot record writes",
+        ))
     }
 
     fn requires_uffd_minor_mode(&self) -> bool {
@@ -415,6 +466,28 @@ impl SocketUffdMemorySource {
             ))),
         }
     }
+
+    /// Report a write to a page the peer already served, and wait for the
+    /// peer to acknowledge it.
+    fn report_page_written(&mut self, gpa: u64, len: u64) -> Result<(), io::Error> {
+        Request::page_written()
+            .write_to(&mut self.stream)
+            .map_err(io_other)?;
+        MemoryRange { gpa, length: len }
+            .write_to(&mut self.stream)
+            .map_err(io_other)?;
+
+        let resp = Response::read_from(&mut self.stream).map_err(io_other)?;
+        match (resp.status(), resp.length()) {
+            (Status::Ok, 0) => Ok(()),
+            (Status::Ok, n) => Err(io::Error::other(format!(
+                "PageWritten response carried {n} unexpected bytes",
+            ))),
+            (s, _) => Err(io::Error::other(format!(
+                "peer returned {s:?} for PageWritten at gpa={gpa:#x} len={len}",
+            ))),
+        }
+    }
 }
 
 impl UffdMemorySource for SocketUffdMemorySource {
@@ -424,6 +497,7 @@ impl UffdMemorySource for SocketUffdMemorySource {
         range: &UffdRange,
         page_idx: u64,
         access: PageAccess,
+        write_protect: bool,
     ) -> Result<(), io::Error> {
         let page_size = range.page_size;
         let page_addr = range.page_addr(page_idx);
@@ -437,7 +511,7 @@ impl UffdMemorySource for SocketUffdMemorySource {
                     "shared-backing PageFault response carried {resp_len} unexpected bytes",
                 )));
             }
-            match uffd_continue(uffd_fd, page_addr, page_size) {
+            match uffd_continue(uffd_fd, page_addr, page_size, write_protect) {
                 Ok(()) => Ok(()),
                 // This is fine, someone mapped the page before us.
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
@@ -459,7 +533,13 @@ impl UffdMemorySource for SocketUffdMemorySource {
                 self.buf.resize(len, 0);
             }
             self.stream.read_exact(&mut self.buf[..len])?;
-            match copy(uffd_fd, page_addr, self.buf.as_ptr(), page_size) {
+            match copy(
+                uffd_fd,
+                page_addr,
+                self.buf.as_ptr(),
+                page_size,
+                write_protect,
+            ) {
                 Ok(()) => Ok(()),
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                     if let Err(e) = wake(uffd_fd, page_addr, page_size) {
@@ -470,6 +550,10 @@ impl UffdMemorySource for SocketUffdMemorySource {
                 Err(e) => Err(e),
             }
         }
+    }
+
+    fn report_written(&mut self, range: &UffdRange, page_idx: u64) -> Result<(), io::Error> {
+        self.report_page_written(range.page_source_offset(page_idx), range.page_size)
     }
 
     fn requires_uffd_minor_mode(&self) -> bool {
@@ -503,6 +587,34 @@ pub(crate) fn poison(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Erro
                 fd.as_raw_fd(),
                 userfaultfd::UFFDIO_POISON as libc::Ioctl,
                 &mut poison,
+            )
+        };
+        if ret >= 0 {
+            return Ok(());
+        }
+
+        let error = Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EAGAIN) {
+            return Err(error);
+        }
+        thread::yield_now();
+    }
+}
+
+/// Remove write protection from a range, waking threads blocked on a
+/// write-protect fault in it.
+pub(crate) fn unprotect(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error> {
+    let mut wp = UffdioWriteprotect {
+        range: UffdioRange { start: addr, len },
+        mode: 0,
+    };
+    loop {
+        // SAFETY: `wp` is a valid, correctly-sized struct for this ioctl.
+        let ret = unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                userfaultfd::UFFDIO_WRITEPROTECT as libc::Ioctl,
+                &mut wp,
             )
         };
         if ret >= 0 {

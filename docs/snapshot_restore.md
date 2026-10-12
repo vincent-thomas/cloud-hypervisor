@@ -342,6 +342,24 @@ prefault on the receiving side:
     receive-migration receiver_url=unix:/tmp/restore.sock,background_fetch_pages=off &
 ```
 
+A daemon that stores snapshots as a base plus diffs needs to know which pages
+the guest modified, not only which ones it accessed. With `track_writes=on`,
+CH reports each page's first write to the daemon:
+
+- A `PageFault` caused by a write carries `PageAccess::Write`.
+- A page faulted in by a read is mapped write-protected. Its first write
+  sends a `PageWritten` request for the page, and the write is held until
+  the daemon acknowledges it. The daemon must not write the page content.
+
+Write tracking requires Linux 5.19 or later for memfd and hugetlbfs backed
+guest memory. Each page tracked this way takes one extra fault on its first
+write.
+
+```bash
+./ch-remote --api-socket /tmp/cloud-hypervisor.sock \
+    receive-migration receiver_url=unix:/tmp/restore.sock,background_fetch_pages=off,track_writes=on &
+```
+
 ### The daemon protocol
 
 The daemon implements the local live-migration wire protocol defined in
